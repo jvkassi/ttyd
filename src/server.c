@@ -20,7 +20,7 @@
 volatile bool force_exit = false;
 struct lws_context *context;
 struct server *server;
-struct endpoints endpoints = {"/ws", "/", "/token", ""};
+struct endpoints endpoints = {"/ws", "/", "/token", "", "/api"};
 
 extern int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 extern int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);

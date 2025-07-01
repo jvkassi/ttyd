@@ -1,6 +1,11 @@
 #include <libwebsockets.h>
 #include <string.h>
 #include <zlib.h>
+#include <json.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 #include "html.h"
 #include "server.h"
@@ -47,6 +52,147 @@ static bool accept_gzip(struct lws *wsi) {
   char buf[256];
   int len = lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_ACCEPT_ENCODING);
   return len > 0 && strstr(buf, "gzip") != NULL;
+}
+
+static char* execute_command(const char* command, int* exit_code) {
+  int stdout_pipe[2];
+  int stderr_pipe[2];
+  
+  if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+    lwsl_err("pipe failed: %s\n", strerror(errno));
+    return NULL;
+  }
+  
+  pid_t pid = fork();
+  if (pid < 0) {
+    lwsl_err("fork failed: %s\n", strerror(errno));
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[0]);
+    close(stderr_pipe[1]);
+    return NULL;
+  }
+  
+  if (pid == 0) {  // Child process
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+    
+    // Redirect stdout and stderr to pipes
+    dup2(stdout_pipe[1], STDOUT_FILENO);
+    dup2(stderr_pipe[1], STDERR_FILENO);
+    
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+    
+    // Execute the command
+    execl("/bin/sh", "sh", "-c", command, NULL);
+    
+    // If execl returns, there was an error
+    exit(127);
+  }
+  
+  // Parent process
+  close(stdout_pipe[1]);
+  close(stderr_pipe[1]);
+  
+  // Read output from pipes
+  char buffer[4096];
+  ssize_t bytes_read;
+  char* stdout_output = NULL;
+  size_t stdout_size = 0;
+  char* stderr_output = NULL;
+  size_t stderr_size = 0;
+  
+  // Set pipes to non-blocking mode
+  fcntl(stdout_pipe[0], F_SETFL, O_NONBLOCK);
+  fcntl(stderr_pipe[0], F_SETFL, O_NONBLOCK);
+  
+  // Read from both pipes until process exits
+  int status;
+  while (waitpid(pid, &status, WNOHANG) == 0) {
+    // Read from stdout
+    bytes_read = read(stdout_pipe[0], buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0) {
+      buffer[bytes_read] = '\0';
+      stdout_output = realloc(stdout_output, stdout_size + bytes_read + 1);
+      if (stdout_output) {
+        memcpy(stdout_output + stdout_size, buffer, bytes_read + 1);
+        stdout_size += bytes_read;
+      }
+    }
+    
+    // Read from stderr
+    bytes_read = read(stderr_pipe[0], buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0) {
+      buffer[bytes_read] = '\0';
+      stderr_output = realloc(stderr_output, stderr_size + bytes_read + 1);
+      if (stderr_output) {
+        memcpy(stderr_output + stderr_size, buffer, bytes_read + 1);
+        stderr_size += bytes_read;
+      }
+    }
+    
+    usleep(10000);  // Sleep for 10ms to avoid busy waiting
+  }
+  
+  // Read any remaining output
+  while ((bytes_read = read(stdout_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+    buffer[bytes_read] = '\0';
+    stdout_output = realloc(stdout_output, stdout_size + bytes_read + 1);
+    if (stdout_output) {
+      memcpy(stdout_output + stdout_size, buffer, bytes_read + 1);
+      stdout_size += bytes_read;
+    }
+  }
+  
+  while ((bytes_read = read(stderr_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+    buffer[bytes_read] = '\0';
+    stderr_output = realloc(stderr_output, stderr_size + bytes_read + 1);
+    if (stderr_output) {
+      memcpy(stderr_output + stderr_size, buffer, bytes_read + 1);
+      stderr_size += bytes_read;
+    }
+  }
+  
+  close(stdout_pipe[0]);
+  close(stderr_pipe[0]);
+  
+  // Ensure null termination
+  if (stdout_output) {
+    stdout_output[stdout_size] = '\0';
+  } else {
+    stdout_output = strdup("");
+  }
+  
+  if (stderr_output) {
+    stderr_output[stderr_size] = '\0';
+  } else {
+    stderr_output = strdup("");
+  }
+  
+  // Create JSON response
+  json_object *json = json_object_new_object();
+  
+  if (WIFEXITED(status)) {
+    *exit_code = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    *exit_code = 128 + WTERMSIG(status);
+  } else {
+    *exit_code = -1;
+  }
+  
+  json_object_object_add(json, "stdout", json_object_new_string(stdout_output));
+  json_object_object_add(json, "stderr", json_object_new_string(stderr_output));
+  json_object_object_add(json, "exit_code", json_object_new_int(*exit_code));
+  
+  const char* json_str = json_object_to_json_string(json);
+  char* result = strdup(json_str);
+  
+  json_object_put(json);
+  free(stdout_output);
+  free(stderr_output);
+  
+  return result;
 }
 
 static bool uncompress_html(char **output, size_t *output_len) {
@@ -109,6 +255,12 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
         default:
           return 1;
       }
+      
+      // Check if this is a POST request to the API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0) {
+        // For POST requests, we'll handle them in the HTTP_BODY and HTTP_BODY_COMPLETION callbacks
+        // Just continue with normal processing for now
+      }
 
       p = buffer + LWS_PRE;
       end = p + sizeof(buffer) - LWS_PRE;
@@ -126,6 +278,175 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
         pss->buffer = pss->ptr = strdup(buf);
         pss->len = n;
+        lws_callback_on_writable(wsi);
+        break;
+      }
+      
+      // Handle API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0) {
+        char command[1024] = {0};
+        
+        // Get the command from the path
+        lwsl_notice("Path: %s\n", pss->path);
+        
+        // Check if there's a command after the API endpoint
+        if (strlen(pss->path) > strlen(endpoints.api) + 1) {
+          // Extract command from path (skip the API endpoint and the slash)
+          const char *cmd_path = pss->path + strlen(endpoints.api) + 1;
+          lwsl_notice("Command path: %s\n", cmd_path);
+          
+          // URL decode the command
+          char *decoded_cmd = malloc(strlen(cmd_path) + 1);
+          if (!decoded_cmd) {
+            lwsl_err("Failed to allocate memory for command\n");
+            return 1;
+          }
+          
+          // Simple URL decoding
+          int i = 0, j = 0;
+          while (cmd_path[i]) {
+            if (cmd_path[i] == '%' && i + 2 < strlen(cmd_path)) {
+              // Handle percent encoding
+              char hex[3] = {cmd_path[i+1], cmd_path[i+2], 0};
+              decoded_cmd[j++] = (char)strtol(hex, NULL, 16);
+              i += 3;
+            } else if (cmd_path[i] == '+') {
+              // Handle plus as space
+              decoded_cmd[j++] = ' ';
+              i++;
+            } else {
+              // Copy character as is
+              decoded_cmd[j++] = cmd_path[i++];
+            }
+          }
+          decoded_cmd[j] = '\0';
+          lwsl_notice("Decoded command: %s\n", decoded_cmd);
+          
+          // Copy to command buffer with length check
+          if (strlen(decoded_cmd) < sizeof(command)) {
+            strcpy(command, decoded_cmd);
+          } else {
+            lwsl_err("Command too long\n");
+            free(decoded_cmd);
+            return 1;
+          }
+          
+          free(decoded_cmd);
+        }
+        
+        // Also try to get command from query string
+        char *query = strchr(pss->path, '?');
+        if (query && strlen(command) == 0) {
+          query++; // Skip the '?'
+          lwsl_notice("Query string: %s\n", query);
+          
+          // Parse the query string to find the 'cmd' parameter
+          char *cmd_param = strstr(query, "cmd=");
+          if (cmd_param) {
+            cmd_param += 4; // Skip "cmd="
+            lwsl_notice("Command parameter: %s\n", cmd_param);
+            
+            // URL decode the command
+            char *decoded_cmd = malloc(strlen(cmd_param) + 1);
+            if (!decoded_cmd) {
+              lwsl_err("Failed to allocate memory for command\n");
+              return 1;
+            }
+            
+            // Simple URL decoding
+            int i = 0, j = 0;
+            while (cmd_param[i]) {
+              if (cmd_param[i] == '%' && i + 2 < strlen(cmd_param)) {
+                // Handle percent encoding
+                char hex[3] = {cmd_param[i+1], cmd_param[i+2], 0};
+                decoded_cmd[j++] = (char)strtol(hex, NULL, 16);
+                i += 3;
+              } else if (cmd_param[i] == '+') {
+                // Handle plus as space
+                decoded_cmd[j++] = ' ';
+                i++;
+              } else {
+                // Copy character as is
+                decoded_cmd[j++] = cmd_param[i++];
+              }
+              
+              // Check for end of command parameter (& or end of string)
+              if (cmd_param[i] == '&' || cmd_param[i] == '\0') {
+                break;
+              }
+            }
+            decoded_cmd[j] = '\0';
+            lwsl_notice("Decoded command: %s\n", decoded_cmd);
+            
+            // Copy to command buffer with length check
+            if (strlen(decoded_cmd) < sizeof(command)) {
+              strcpy(command, decoded_cmd);
+            } else {
+              lwsl_err("Command too long\n");
+              free(decoded_cmd);
+              return 1;
+            }
+            
+            free(decoded_cmd);
+          }
+        }
+        
+        // If no command was provided or it's empty
+        if (strlen(command) == 0) {
+          const char *error_msg = "{\"error\": \"No command provided\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+          lws_callback_on_writable(wsi);
+          break;
+        }
+        
+        // Execute the command and get JSON result
+        int exit_code;
+        char *result = execute_command(command, &exit_code);
+        
+        if (!result) {
+          const char *error_msg = "{\"error\": \"Failed to execute command\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+        } else {
+          size_t n = strlen(result);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_ACCESS_CONTROL_ALLOW_ORIGIN,
+                                          (unsigned char *)"*", 1, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+            free(result);
+            return 1;
+          }
+          
+          pss->buffer = pss->ptr = result;
+          pss->len = n;
+        }
+        
         lws_callback_on_writable(wsi);
         break;
       }
@@ -215,6 +536,133 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
     case LWS_CALLBACK_HTTP_FILE_COMPLETION:
       goto try_to_reuse;
+      
+    case LWS_CALLBACK_HTTP_BODY:
+      // Handle POST data for API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0) {
+        // Allocate or reallocate buffer for POST data
+        if (pss->buffer == NULL) {
+          pss->buffer = malloc(len + 1);
+          if (pss->buffer == NULL) {
+            lwsl_err("Out of memory\n");
+            return 1;
+          }
+          memcpy(pss->buffer, in, len);
+          pss->buffer[len] = '\0';
+          pss->len = len;
+        } else {
+          char *new_buffer = realloc(pss->buffer, pss->len + len + 1);
+          if (new_buffer == NULL) {
+            lwsl_err("Out of memory\n");
+            free(pss->buffer);
+            pss->buffer = NULL;
+            return 1;
+          }
+          pss->buffer = new_buffer;
+          memcpy(pss->buffer + pss->len, in, len);
+          pss->len += len;
+          pss->buffer[pss->len] = '\0';
+        }
+      }
+      break;
+      
+    case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+      // Process the complete POST data for API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0 && pss->buffer != NULL) {
+        p = buffer + LWS_PRE;
+        end = p + sizeof(buffer) - LWS_PRE;
+        
+        // Parse JSON request
+        json_object *json = json_tokener_parse(pss->buffer);
+        if (!json) {
+          const char *error_msg = "{\"error\": \"Invalid JSON\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          free(pss->buffer);
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+          lws_callback_on_writable(wsi);
+          break;
+        }
+        
+        // Extract command from JSON
+        struct json_object *cmd_obj = NULL;
+        if (!json_object_object_get_ex(json, "command", &cmd_obj) || 
+            !json_object_is_type(cmd_obj, json_type_string)) {
+          const char *error_msg = "{\"error\": \"Missing or invalid 'command' field\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+            json_object_put(json);
+            return 1;
+          }
+          
+          free(pss->buffer);
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+          lws_callback_on_writable(wsi);
+          json_object_put(json);
+          break;
+        }
+        
+        const char *command = json_object_get_string(cmd_obj);
+        
+        // Execute the command
+        int exit_code;
+        free(pss->buffer);
+        pss->buffer = NULL;
+        char *result = execute_command(command, &exit_code);
+        json_object_put(json);
+        
+        if (!result) {
+          const char *error_msg = "{\"error\": \"Failed to execute command\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+        } else {
+          size_t n = strlen(result);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_ACCESS_CONTROL_ALLOW_ORIGIN,
+                                          (unsigned char *)"*", 1, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+            free(result);
+            return 1;
+          }
+          
+          pss->buffer = pss->ptr = result;
+          pss->len = n;
+        }
+        
+        lws_callback_on_writable(wsi);
+      }
+      break;
 #if (defined(LWS_OPENSSL_SUPPORT) || defined(LWS_WITH_TLS)) && !defined(LWS_WITH_MBEDTLS)
     case LWS_CALLBACK_OPENSSL_PERFORM_CLIENT_CERT_VERIFICATION:
       if (!len || (SSL_get_verify_result((SSL *)in) != X509_V_OK)) {
