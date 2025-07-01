@@ -106,3 +106,58 @@ Modern browsers, See [Browser Support](https://github.com/xtermjs/xterm.js#brows
 
 * [Wetty](https://github.com/krishnasrinivas/wetty): [Node](https://nodejs.org) based web terminal (SSH/login)
 * [GoTTY](https://github.com/yudai/gotty): [Go](https://golang.org) based web terminal
+
+## HTTP API for Command Execution
+
+ttyd now supports an experimental HTTP API for executing commands and retrieving their output. This can be useful for automation or integration with other services.
+
+**Endpoint:** `/api/command`
+
+**Method:** `POST`
+
+**Request Body:** JSON payload specifying the command and its arguments.
+
+Example:
+```json
+{
+  "command": ["/bin/ls", "-l", "/tmp"]
+}
+```
+Or, for a command in PATH:
+```json
+{
+  "command": ["uname", "-a"]
+}
+```
+
+**Response Body:** JSON payload containing the standard output, standard error, and exit code of the command.
+
+Example Success:
+```json
+{
+  "stdout": "total 0\ndrwxrwxrwt 2 root root 60 Oct 27 10:00 some_dir\n",
+  "stderr": "",
+  "exit_code": 0
+}
+```
+
+Example Error (e.g., command not found):
+```json
+{
+  "stdout": "",
+  "stderr": "execvp: No such file or directory\n",
+  "exit_code": 127
+}
+```
+*(Note: The exact stderr message from `execvp` might vary slightly by OS, but the intent is shown)*
+
+Example Bad Request (e.g., malformed JSON or missing `command` field):
+```json
+{
+  "error": "Invalid or missing command array in JSON payload. Expected: {\\"command\\": [\\"cmd\\", \\"arg1\\"]}"
+}
+```
+
+**Authentication:** The API endpoint is protected by the same authentication mechanisms configured for ttyd (e.g., basic authentication via the `-c` option or auth header via `-H`). If authentication is enabled, clients must provide valid credentials with their POST request.
+
+**Note:** This feature is synchronous. The HTTP request will be held open until the command finishes executing. For long-running commands, consider the potential for timeouts on the client or intermediary proxies.

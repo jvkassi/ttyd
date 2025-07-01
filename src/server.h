@@ -31,9 +31,12 @@ extern struct endpoints endpoints;
 
 struct pss_http {
   char path[128];
-  char *buffer;
-  char *ptr;
-  size_t len;
+  char *buffer; // Used for sending response
+  char *ptr;    // Used for sending response
+  size_t len;   // Used for sending response
+
+  char *post_data; // To store incoming POST body
+  size_t post_data_len; // Length of POST data
 };
 
 struct pss_tty {

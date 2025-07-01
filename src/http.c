@@ -1,12 +1,122 @@
 #include <libwebsockets.h>
 #include <string.h>
 #include <zlib.h>
+#include <json.h> // For JSON parsing
+#include <unistd.h> // For pipe, fork, exec
+#include <sys/wait.h> // For waitpid
+#include <errno.h> // For errno
 
 #include "html.h"
 #include "server.h"
 #include "utils.h"
+#include "pty.h" // For PTY functions
 
 enum { AUTH_OK, AUTH_FAIL, AUTH_ERROR };
+
+// Helper function to execute command and capture output
+struct command_result {
+    char *stdout_str;
+    char *stderr_str;
+    int exit_code;
+};
+
+//static struct command_result execute_command(const char *command_str) {
+static struct command_result execute_command(char *const argv[]) { // Changed signature
+    struct command_result result = {NULL, NULL, -1};
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    pid_t pid;
+
+    if (pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
+        perror("pipe");
+        return result; // Indicate error
+    }
+
+    pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        close(stderr_pipe[0]); close(stderr_pipe[1]);
+        return result; // Indicate error
+    }
+
+    if (pid == 0) { // Child process
+        close(stdout_pipe[0]); // Close read end of stdout pipe
+        dup2(stdout_pipe[1], STDOUT_FILENO); // Redirect stdout
+        close(stdout_pipe[1]); // Close write end of stdout pipe
+
+        close(stderr_pipe[0]); // Close read end of stderr pipe
+        dup2(stderr_pipe[1], STDERR_FILENO); // Redirect stderr
+        close(stderr_pipe[1]); // Close write end of stderr pipe
+
+        // execvp expects a null-terminated array of strings (char *argv[])
+        // command_str is now expected to be a json array of strings ["command", "arg1", "arg2"]
+        // We need to parse this outside and pass the array to execute_command,
+        // or parse it here. For simplicity, let's assume command_str is just the command
+        // and we will modify the calling code to pass arguments properly.
+        // For now, let's adjust this to take char *const argv[]
+        // No, let's change the input to execute_command to be char *const *argv
+        // The parsing of JSON into argv will happen in LWS_CALLBACK_HTTP_BODY_COMPLETION.
+        // This function will now expect `char *const argv[]`
+
+        // The function signature needs to change.
+        // static struct command_result execute_command(const char *command_str) ->
+        // static struct command_result execute_command(char *const argv[])
+        // This change will be made in multiple steps. First, let's adjust the execvp call assuming argv is passed.
+        // For now, we'll keep the old parsing as a placeholder until the calling code is updated.
+        // THIS SECTION WILL BE REPLACED AFTER JSON PARSING IS UPDATED.
+        // The above comments are now outdated. We directly use argv.
+
+        if (!argv || !argv[0]) {
+            fprintf(stderr, "No command provided to execute_command\n");
+            _exit(127); // Should not happen if called correctly
+        }
+
+        execvp(argv[0], argv);
+        perror("execvp"); // Log to ttyd's stderr, not client's
+        _exit(127); // Exit child if execvp fails
+    } else { // Parent process
+        close(stdout_pipe[1]); // Close write end of stdout pipe
+        close(stderr_pipe[1]); // Close write end of stderr pipe
+
+        char buffer[4096];
+        ssize_t bytes_read;
+
+        // Read stdout
+        result.stdout_str = strdup(""); // Initialize to empty string
+        while ((bytes_read = read(stdout_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[bytes_read] = '\0';
+            char *temp = result.stdout_str;
+            result.stdout_str = xmalloc(strlen(temp) + bytes_read + 1);
+            strcpy(result.stdout_str, temp);
+            strcat(result.stdout_str, buffer);
+            free(temp);
+        }
+        close(stdout_pipe[0]);
+
+        // Read stderr
+        result.stderr_str = strdup(""); // Initialize to empty string
+        while ((bytes_read = read(stderr_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[bytes_read] = '\0';
+            char *temp = result.stderr_str;
+            result.stderr_str = xmalloc(strlen(temp) + bytes_read + 1);
+            strcpy(result.stderr_str, temp);
+            strcat(result.stderr_str, buffer);
+            free(temp);
+        }
+        close(stderr_pipe[0]);
+
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            result.exit_code = WEXITSTATUS(status);
+        } else {
+            result.exit_code = -1; // Indicate error or signal termination
+        }
+    }
+    return result;
+}
+
 
 static char *html_cache = NULL;
 static size_t html_cache_len = 0;
@@ -113,7 +223,44 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
       p = buffer + LWS_PRE;
       end = p + sizeof(buffer) - LWS_PRE;
 
-      if (strcmp(pss->path, endpoints.token) == 0) {
+      if (strcmp(pss->path, "/api/command") == 0) {
+        // This callback is called when the HTTP headers are received.
+        // We need to wait for the request body to be received before processing the command.
+        // For now, we'll just set a flag or state in pss to indicate that we're expecting a body for this request.
+        // The actual processing will happen in LWS_CALLBACK_HTTP_BODY.
+        // However, libwebsockets handles HTTP POST body differently.
+        // We need to read it in LWS_CALLBACK_HTTP_BODY_COMPLETION or by checking lws_remaining_packet_payload in LWS_CALLBACK_HTTP.
+        // For simplicity, we'll assume the body is small and comes in one go for now.
+        // A more robust solution would handle fragmented POST bodies.
+
+        // Check if it's a POST request
+        if (lws_hdr_total_length(wsi, WSI_TOKEN_POST_URI) == 0) {
+            // Not a POST request, or some other method.
+            const char *err_msg = "{\"error\": \"Invalid request method. Only POST is supported.\"}";
+            size_t n = strlen(err_msg);
+            if (lws_add_http_header_status(wsi, HTTP_STATUS_METHOD_NOT_ALLOWED, &p, end) ||
+                lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+                lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+                lws_finalize_http_header(wsi, &p, end) ||
+                lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+                return 1;
+            pss->buffer = pss->ptr = strdup(err_msg);
+            pss->len = n;
+            lws_callback_on_writable(wsi);
+            return 0; // Or 1 for error?
+        }
+
+        // Indicate that we expect a body. We'll store the body in pss->post_data
+        pss->post_data = NULL;
+        pss->post_data_len = 0;
+        // libwebsockets will call LWS_CALLBACK_HTTP_BODY / LWS_CALLBACK_HTTP_BODY_COMPLETION
+        // We will handle the command execution there.
+        // For now, just acknowledge the request.
+        // A proper response will be sent after processing the body.
+        // This part might need to be restructured if body handling is complex.
+        return 0; // Defer response until body is processed
+
+      } else if (strcmp(pss->path, endpoints.token) == 0) {
         const char *credential = server->credential != NULL ? server->credential : "";
         size_t n = sprintf(buf, "{\"token\": \"%s\"}", credential);
         if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
@@ -226,6 +373,125 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
       }
       break;
 #endif
+    case LWS_CALLBACK_HTTP_BODY:
+        if (strcmp(pss->path, "/api/command") == 0) {
+            // Append received data to pss->post_data
+            if (len > 0) {
+                pss->post_data = xrealloc(pss->post_data, pss->post_data_len + len + 1);
+                memcpy(pss->post_data + pss->post_data_len, in, len);
+                pss->post_data_len += len;
+                pss->post_data[pss->post_data_len] = '\0'; // Null-terminate for string operations
+            }
+        }
+        break;
+
+    case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+        if (strcmp(pss->path, "/api/command") == 0) {
+            // POST body is completely received. Now process the command.
+            // char *cmd_to_exec = NULL; // Old way
+            char **cmd_argv = NULL;
+            int cmd_argc = 0;
+
+            if (pss->post_data != NULL) {
+                json_object *jobj = json_tokener_parse(pss->post_data);
+                if (jobj != NULL) {
+                    json_object *j_command_arr;
+                    if (json_object_object_get_ex(jobj, "command", &j_command_arr) &&
+                        json_object_is_type(j_command_arr, json_type_array)) {
+
+                        cmd_argc = json_object_array_length(j_command_arr);
+                        if (cmd_argc > 0) {
+                            cmd_argv = xmalloc(sizeof(char *) * (cmd_argc + 1));
+                            for (int i = 0; i < cmd_argc; i++) {
+                                json_object *j_arg = json_object_array_get_idx(j_command_arr, i);
+                                if (json_object_is_type(j_arg, json_type_string)) {
+                                    cmd_argv[i] = strdup(json_object_get_string(j_arg));
+                                } else {
+                                    // Arg is not a string, error out
+                                    lwsl_err("Command argument is not a string at index %d\n", i);
+                                    for (int k = 0; k < i; k++) free(cmd_argv[k]);
+                                    free(cmd_argv);
+                                    cmd_argv = NULL;
+                                    cmd_argc = 0;
+                                    break;
+                                }
+                            }
+                            if (cmd_argv) cmd_argv[cmd_argc] = NULL; // Null-terminate the array
+                        }
+                    }
+                    json_object_put(jobj); // free jobj
+                }
+            }
+
+            if (cmd_argv == NULL || cmd_argc == 0) {
+                const char *err_msg = "{\"error\": \"Invalid or missing command array in JSON payload. Expected: {\\\"command\\\": [\\\"cmd\\\", \\\"arg1\\\"]}\"}";
+                p = buffer + LWS_PRE; // Re-init p and end for this scope
+                end = p + sizeof(buffer) - LWS_PRE;
+                size_t n_err = strlen(err_msg);
+                if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+                    lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+                    lws_add_http_header_content_length(wsi, (unsigned long)n_err, &p, end) ||
+                    lws_finalize_http_header(wsi, &p, end) ||
+                    lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+                     if (pss->post_data) free(pss->post_data);
+                     return 1;
+                }
+                pss->buffer = pss->ptr = strdup(err_msg);
+                pss->len = n_err;
+                lws_callback_on_writable(wsi);
+                if (pss->post_data) free(pss->post_data);
+                return 0;
+            }
+
+            struct command_result cmd_res = execute_command(cmd_argv);
+
+            // Free cmd_argv and its contents
+            if (cmd_argv) {
+                for (int i = 0; i < cmd_argc; i++) {
+                    free(cmd_argv[i]);
+                }
+                free(cmd_argv);
+            }
+
+            json_object *json_resp = json_object_new_object();
+            json_object_object_add(json_resp, "stdout", json_object_new_string(cmd_res.stdout_str ? cmd_res.stdout_str : ""));
+            json_object_object_add(json_resp, "stderr", json_object_new_string(cmd_res.stderr_str ? cmd_res.stderr_str : ""));
+            json_object_object_add(json_resp, "exit_code", json_object_new_int(cmd_res.exit_code));
+
+            const char *response_str = json_object_to_json_string_ext(json_resp, JSON_C_TO_STRING_PLAIN);
+            size_t n_resp = strlen(response_str);
+
+            p = buffer + LWS_PRE; // Re-init p and end
+            end = p + sizeof(buffer) - LWS_PRE;
+
+            if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+                lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+                lws_add_http_header_content_length(wsi, (unsigned long)n_resp, &p, end) ||
+                lws_finalize_http_header(wsi, &p, end) ||
+                lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+                // cmd_argv is already freed at this point if it was allocated
+                if (cmd_res.stdout_str) free(cmd_res.stdout_str);
+                if (cmd_res.stderr_str) free(cmd_res.stderr_str);
+                json_object_put(json_resp);
+                if (pss->post_data) free(pss->post_data);
+                return 1;
+            }
+            pss->buffer = pss->ptr = strdup(response_str); // strdup because response_str is from json_object_to_json_string_ext
+            pss->len = n_resp;
+            lws_callback_on_writable(wsi);
+
+            // cmd_argv is already freed
+            if (cmd_res.stdout_str) free(cmd_res.stdout_str);
+            if (cmd_res.stderr_str) free(cmd_res.stderr_str);
+            json_object_put(json_resp); // free json_resp and associated string from json_object_to_json_string_ext
+            if (pss->post_data) {
+                free(pss->post_data);
+                pss->post_data = NULL;
+                pss->post_data_len = 0;
+            }
+        }
+        break;
+
     default:
       break;
   }
