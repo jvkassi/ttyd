@@ -1,6 +1,11 @@
 #include <libwebsockets.h>
 #include <string.h>
 #include <zlib.h>
+#include <json.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 #include "html.h"
 #include "server.h"
@@ -47,6 +52,163 @@ static bool accept_gzip(struct lws *wsi) {
   char buf[256];
   int len = lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_ACCEPT_ENCODING);
   return len > 0 && strstr(buf, "gzip") != NULL;
+}
+
+// Structure to hold command execution results
+typedef struct {
+  char *stdout_data;
+  size_t stdout_size;
+  char *stderr_data;
+  size_t stderr_size;
+  int exit_code;
+  bool command_complete;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+} command_result_t;
+
+// Global variable to store the current command execution
+static command_result_t *current_command = NULL;
+
+// Function to send a command to the ttyd terminal
+static bool send_command_to_terminal(struct pss_tty *pss, const char *command) {
+  if (!pss || !pss->process || !command) return false;
+  
+  // Create a buffer with the command and a newline
+  size_t cmd_len = strlen(command);
+  char *buffer = xmalloc(cmd_len + 2); // +1 for newline, +1 for null terminator
+  
+  // Format: INPUT + command + newline
+  buffer[0] = INPUT;
+  memcpy(buffer + 1, command, cmd_len);
+  buffer[cmd_len + 1] = '\n';
+  
+  // Send the command to the terminal
+  int err = pty_write(pss->process, pty_buf_init(buffer + 1, cmd_len + 1));
+  free(buffer);
+  
+  if (err) {
+    lwsl_err("pty_write failed: %s (%s)\n", uv_err_name(err), uv_strerror(err));
+    return false;
+  }
+  
+  return true;
+}
+
+// Modified process_read_cb to capture command output
+void capture_command_output(const char *data, size_t len) {
+  if (!current_command || !data || len == 0) return;
+  
+  pthread_mutex_lock(&current_command->mutex);
+  
+  // Append to stdout buffer
+  current_command->stdout_data = realloc(current_command->stdout_data, 
+                                        current_command->stdout_size + len + 1);
+  if (current_command->stdout_data) {
+    memcpy(current_command->stdout_data + current_command->stdout_size, data, len);
+    current_command->stdout_size += len;
+    current_command->stdout_data[current_command->stdout_size] = '\0';
+  }
+  
+  pthread_mutex_unlock(&current_command->mutex);
+}
+
+// Function to execute a command in the ttyd terminal
+static char* execute_command(const char* command, int* exit_code) {
+  // Find an active ttyd terminal session
+  struct pss_tty *active_session = find_active_tty_session();
+  
+  // Create JSON response object
+  json_object *json = json_object_new_object();
+  
+  if (!active_session || !active_session->process || !process_running(active_session->process)) {
+    // No active terminal session found
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string(
+      "No active terminal session found.\n"
+      "Please open a terminal session in the browser first."
+    ));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
+    
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    return result;
+  }
+  
+  // Create a command context to capture output
+  cmd_context_t *cmd_ctx = cmd_context_new();
+  if (!cmd_ctx) {
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string("Failed to create command context"));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
+    
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    return result;
+  }
+  
+  // Set the command context in the terminal session
+  active_session->cmd_ctx = cmd_ctx;
+  active_session->capturing_output = true;
+  
+  // Send the command to the terminal
+  if (!send_pty_command(active_session, command)) {
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string("Failed to send command to terminal"));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
+    
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    
+    active_session->cmd_ctx = NULL;
+    active_session->capturing_output = false;
+    cmd_context_free(cmd_ctx);
+    
+    return result;
+  }
+  
+  // Wait for command output (with timeout)
+  char *output = wait_for_command_output(cmd_ctx, 5000, exit_code);
+  
+  // Clean up
+  active_session->cmd_ctx = NULL;
+  active_session->capturing_output = false;
+  cmd_context_free(cmd_ctx);
+  
+  if (!output) {
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string("Command execution timed out"));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
+    
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    return result;
+  }
+  
+  // Create JSON response
+  json_object_put(json);
+  json = json_object_new_object();
+  
+  // For simplicity, we put all output in stdout
+  // In a real implementation, you would need to separate stdout and stderr
+  json_object_object_add(json, "stdout", json_object_new_string(output));
+  json_object_object_add(json, "stderr", json_object_new_string(""));
+  json_object_object_add(json, "exit_code", json_object_new_int(*exit_code));
+  
+  const char* json_str = json_object_to_json_string(json);
+  char* result = strdup(json_str);
+  
+  json_object_put(json);
+  free(output);
+  
+  return result;
 }
 
 static bool uncompress_html(char **output, size_t *output_len) {
@@ -109,6 +271,12 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
         default:
           return 1;
       }
+      
+      // Check if this is a POST request to the API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0) {
+        // For POST requests, we'll handle them in the HTTP_BODY and HTTP_BODY_COMPLETION callbacks
+        // Just continue with normal processing for now
+      }
 
       p = buffer + LWS_PRE;
       end = p + sizeof(buffer) - LWS_PRE;
@@ -126,6 +294,175 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
         pss->buffer = pss->ptr = strdup(buf);
         pss->len = n;
+        lws_callback_on_writable(wsi);
+        break;
+      }
+      
+      // Handle API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0) {
+        char command[1024] = {0};
+        
+        // Get the command from the path
+        lwsl_notice("Path: %s\n", pss->path);
+        
+        // Check if there's a command after the API endpoint
+        if (strlen(pss->path) > strlen(endpoints.api) + 1) {
+          // Extract command from path (skip the API endpoint and the slash)
+          const char *cmd_path = pss->path + strlen(endpoints.api) + 1;
+          lwsl_notice("Command path: %s\n", cmd_path);
+          
+          // URL decode the command
+          char *decoded_cmd = malloc(strlen(cmd_path) + 1);
+          if (!decoded_cmd) {
+            lwsl_err("Failed to allocate memory for command\n");
+            return 1;
+          }
+          
+          // Simple URL decoding
+          int i = 0, j = 0;
+          while (cmd_path[i]) {
+            if (cmd_path[i] == '%' && i + 2 < strlen(cmd_path)) {
+              // Handle percent encoding
+              char hex[3] = {cmd_path[i+1], cmd_path[i+2], 0};
+              decoded_cmd[j++] = (char)strtol(hex, NULL, 16);
+              i += 3;
+            } else if (cmd_path[i] == '+') {
+              // Handle plus as space
+              decoded_cmd[j++] = ' ';
+              i++;
+            } else {
+              // Copy character as is
+              decoded_cmd[j++] = cmd_path[i++];
+            }
+          }
+          decoded_cmd[j] = '\0';
+          lwsl_notice("Decoded command: %s\n", decoded_cmd);
+          
+          // Copy to command buffer with length check
+          if (strlen(decoded_cmd) < sizeof(command)) {
+            strcpy(command, decoded_cmd);
+          } else {
+            lwsl_err("Command too long\n");
+            free(decoded_cmd);
+            return 1;
+          }
+          
+          free(decoded_cmd);
+        }
+        
+        // Also try to get command from query string
+        char *query = strchr(pss->path, '?');
+        if (query && strlen(command) == 0) {
+          query++; // Skip the '?'
+          lwsl_notice("Query string: %s\n", query);
+          
+          // Parse the query string to find the 'cmd' parameter
+          char *cmd_param = strstr(query, "cmd=");
+          if (cmd_param) {
+            cmd_param += 4; // Skip "cmd="
+            lwsl_notice("Command parameter: %s\n", cmd_param);
+            
+            // URL decode the command
+            char *decoded_cmd = malloc(strlen(cmd_param) + 1);
+            if (!decoded_cmd) {
+              lwsl_err("Failed to allocate memory for command\n");
+              return 1;
+            }
+            
+            // Simple URL decoding
+            int i = 0, j = 0;
+            while (cmd_param[i]) {
+              if (cmd_param[i] == '%' && i + 2 < strlen(cmd_param)) {
+                // Handle percent encoding
+                char hex[3] = {cmd_param[i+1], cmd_param[i+2], 0};
+                decoded_cmd[j++] = (char)strtol(hex, NULL, 16);
+                i += 3;
+              } else if (cmd_param[i] == '+') {
+                // Handle plus as space
+                decoded_cmd[j++] = ' ';
+                i++;
+              } else {
+                // Copy character as is
+                decoded_cmd[j++] = cmd_param[i++];
+              }
+              
+              // Check for end of command parameter (& or end of string)
+              if (cmd_param[i] == '&' || cmd_param[i] == '\0') {
+                break;
+              }
+            }
+            decoded_cmd[j] = '\0';
+            lwsl_notice("Decoded command: %s\n", decoded_cmd);
+            
+            // Copy to command buffer with length check
+            if (strlen(decoded_cmd) < sizeof(command)) {
+              strcpy(command, decoded_cmd);
+            } else {
+              lwsl_err("Command too long\n");
+              free(decoded_cmd);
+              return 1;
+            }
+            
+            free(decoded_cmd);
+          }
+        }
+        
+        // If no command was provided or it's empty
+        if (strlen(command) == 0) {
+          const char *error_msg = "{\"error\": \"No command provided\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+          lws_callback_on_writable(wsi);
+          break;
+        }
+        
+        // Execute the command and get JSON result
+        int exit_code;
+        char *result = execute_command(command, &exit_code);
+        
+        if (!result) {
+          const char *error_msg = "{\"error\": \"Failed to execute command\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+        } else {
+          size_t n = strlen(result);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_ACCESS_CONTROL_ALLOW_ORIGIN,
+                                          (unsigned char *)"*", 1, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+            free(result);
+            return 1;
+          }
+          
+          pss->buffer = pss->ptr = result;
+          pss->len = n;
+        }
+        
         lws_callback_on_writable(wsi);
         break;
       }
@@ -215,6 +552,133 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
     case LWS_CALLBACK_HTTP_FILE_COMPLETION:
       goto try_to_reuse;
+      
+    case LWS_CALLBACK_HTTP_BODY:
+      // Handle POST data for API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0) {
+        // Allocate or reallocate buffer for POST data
+        if (pss->buffer == NULL) {
+          pss->buffer = malloc(len + 1);
+          if (pss->buffer == NULL) {
+            lwsl_err("Out of memory\n");
+            return 1;
+          }
+          memcpy(pss->buffer, in, len);
+          pss->buffer[len] = '\0';
+          pss->len = len;
+        } else {
+          char *new_buffer = realloc(pss->buffer, pss->len + len + 1);
+          if (new_buffer == NULL) {
+            lwsl_err("Out of memory\n");
+            free(pss->buffer);
+            pss->buffer = NULL;
+            return 1;
+          }
+          pss->buffer = new_buffer;
+          memcpy(pss->buffer + pss->len, in, len);
+          pss->len += len;
+          pss->buffer[pss->len] = '\0';
+        }
+      }
+      break;
+      
+    case LWS_CALLBACK_HTTP_BODY_COMPLETION:
+      // Process the complete POST data for API endpoint
+      if (strncmp(pss->path, endpoints.api, strlen(endpoints.api)) == 0 && pss->buffer != NULL) {
+        p = buffer + LWS_PRE;
+        end = p + sizeof(buffer) - LWS_PRE;
+        
+        // Parse JSON request
+        json_object *json = json_tokener_parse(pss->buffer);
+        if (!json) {
+          const char *error_msg = "{\"error\": \"Invalid JSON\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          free(pss->buffer);
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+          lws_callback_on_writable(wsi);
+          break;
+        }
+        
+        // Extract command from JSON
+        struct json_object *cmd_obj = NULL;
+        if (!json_object_object_get_ex(json, "command", &cmd_obj) || 
+            !json_object_is_type(cmd_obj, json_type_string)) {
+          const char *error_msg = "{\"error\": \"Missing or invalid 'command' field\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_BAD_REQUEST, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+            json_object_put(json);
+            return 1;
+          }
+          
+          free(pss->buffer);
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+          lws_callback_on_writable(wsi);
+          json_object_put(json);
+          break;
+        }
+        
+        const char *command = json_object_get_string(cmd_obj);
+        
+        // Execute the command
+        int exit_code;
+        free(pss->buffer);
+        pss->buffer = NULL;
+        char *result = execute_command(command, &exit_code);
+        json_object_put(json);
+        
+        if (!result) {
+          const char *error_msg = "{\"error\": \"Failed to execute command\", \"exit_code\": 1}";
+          size_t n = strlen(error_msg);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+          
+          pss->buffer = pss->ptr = strdup(error_msg);
+          pss->len = n;
+        } else {
+          size_t n = strlen(result);
+          
+          if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+                                          (unsigned char *)"application/json;charset=utf-8", 30, &p, end) ||
+              lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_ACCESS_CONTROL_ALLOW_ORIGIN,
+                                          (unsigned char *)"*", 1, &p, end) ||
+              lws_add_http_header_content_length(wsi, (unsigned long)n, &p, end) ||
+              lws_finalize_http_header(wsi, &p, end) ||
+              lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0) {
+            free(result);
+            return 1;
+          }
+          
+          pss->buffer = pss->ptr = result;
+          pss->len = n;
+        }
+        
+        lws_callback_on_writable(wsi);
+      }
+      break;
 #if (defined(LWS_OPENSSL_SUPPORT) || defined(LWS_WITH_TLS)) && !defined(LWS_WITH_MBEDTLS)
     case LWS_CALLBACK_OPENSSL_PERFORM_CLIENT_CERT_VERIFICATION:
       if (!len || (SSL_get_verify_result((SSL *)in) != X509_V_OK)) {

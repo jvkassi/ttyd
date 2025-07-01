@@ -20,7 +20,154 @@
 volatile bool force_exit = false;
 struct lws_context *context;
 struct server *server;
-struct endpoints endpoints = {"/ws", "/", "/token", ""};
+struct endpoints endpoints = {"/ws", "/", "/token", "", "/api"};
+
+// Global registry of active terminal sessions
+struct pss_tty *tty_sessions[MAX_TTY_SESSIONS] = {NULL};
+int tty_session_count = 0;
+pthread_mutex_t tty_sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// HTTP API implementation
+void register_tty_session(struct pss_tty *pss) {
+  pthread_mutex_lock(&tty_sessions_mutex);
+  if (tty_session_count < MAX_TTY_SESSIONS) {
+    tty_sessions[tty_session_count++] = pss;
+    lwsl_notice("Registered TTY session, total: %d\n", tty_session_count);
+  } else {
+    lwsl_warn("Maximum TTY sessions reached, cannot register new session\n");
+  }
+  pthread_mutex_unlock(&tty_sessions_mutex);
+}
+
+void unregister_tty_session(struct pss_tty *pss) {
+  pthread_mutex_lock(&tty_sessions_mutex);
+  for (int i = 0; i < tty_session_count; i++) {
+    if (tty_sessions[i] == pss) {
+      // Remove by shifting remaining elements
+      for (int j = i; j < tty_session_count - 1; j++) {
+        tty_sessions[j] = tty_sessions[j + 1];
+      }
+      tty_session_count--;
+      tty_sessions[tty_session_count] = NULL;
+      lwsl_notice("Unregistered TTY session, remaining: %d\n", tty_session_count);
+      break;
+    }
+  }
+  pthread_mutex_unlock(&tty_sessions_mutex);
+}
+
+struct pss_tty *find_active_tty_session() {
+  struct pss_tty *session = NULL;
+  
+  pthread_mutex_lock(&tty_sessions_mutex);
+  if (tty_session_count > 0) {
+    // Return the first active session
+    for (int i = 0; i < tty_session_count; i++) {
+      if (tty_sessions[i] && tty_sessions[i]->process && process_running(tty_sessions[i]->process)) {
+        session = tty_sessions[i];
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&tty_sessions_mutex);
+  
+  return session;
+}
+
+cmd_context_t *cmd_context_new() {
+  cmd_context_t *ctx = xmalloc(sizeof(cmd_context_t));
+  ctx->output = NULL;
+  ctx->output_len = 0;
+  ctx->output_capacity = 0;
+  ctx->complete = false;
+  ctx->exit_code = 0;
+  pthread_mutex_init(&ctx->mutex, NULL);
+  pthread_cond_init(&ctx->cond, NULL);
+  clock_gettime(CLOCK_MONOTONIC, &ctx->start_time);
+  return ctx;
+}
+
+void cmd_context_free(cmd_context_t *ctx) {
+  if (!ctx) return;
+  
+  pthread_mutex_lock(&ctx->mutex);
+  if (ctx->output) {
+    free(ctx->output);
+    ctx->output = NULL;
+  }
+  pthread_mutex_unlock(&ctx->mutex);
+  
+  pthread_mutex_destroy(&ctx->mutex);
+  pthread_cond_destroy(&ctx->cond);
+  free(ctx);
+}
+
+bool send_pty_command(struct pss_tty *pss, const char *command) {
+  if (!pss || !pss->process || !command) return false;
+  
+  // Create a buffer with the command and a newline
+  size_t cmd_len = strlen(command);
+  char *buffer = xmalloc(cmd_len + 2); // +1 for newline, +1 for null terminator
+  
+  // Copy command and add newline
+  memcpy(buffer, command, cmd_len);
+  buffer[cmd_len] = '\n';
+  buffer[cmd_len + 1] = '\0';
+  
+  // Send the command to the terminal
+  pty_buf_t *buf = pty_buf_init(buffer, cmd_len + 1);
+  int err = pty_write(pss->process, buf);
+  free(buffer);
+  
+  if (err) {
+    lwsl_err("pty_write failed: %s (%s)\n", uv_err_name(err), uv_strerror(err));
+    return false;
+  }
+  
+  return true;
+}
+
+char *wait_for_command_output(cmd_context_t *ctx, int timeout_ms, int *exit_code) {
+  if (!ctx) return NULL;
+  
+  char *result = NULL;
+  struct timespec timeout;
+  clock_gettime(CLOCK_MONOTONIC, &timeout);
+  timeout.tv_sec += timeout_ms / 1000;
+  timeout.tv_nsec += (timeout_ms % 1000) * 1000000;
+  if (timeout.tv_nsec >= 1000000000) {
+    timeout.tv_sec += 1;
+    timeout.tv_nsec -= 1000000000;
+  }
+  
+  pthread_mutex_lock(&ctx->mutex);
+  
+  // Wait for command to complete or timeout
+  while (!ctx->complete) {
+    int ret = pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &timeout);
+    if (ret == ETIMEDOUT) {
+      lwsl_notice("Command execution timed out after %d ms\n", timeout_ms);
+      break;
+    }
+  }
+  
+  // Copy the output
+  if (ctx->output && ctx->output_len > 0) {
+    result = xmalloc(ctx->output_len + 1);
+    memcpy(result, ctx->output, ctx->output_len);
+    result[ctx->output_len] = '\0';
+  } else {
+    result = strdup("");
+  }
+  
+  if (exit_code) {
+    *exit_code = ctx->exit_code;
+  }
+  
+  pthread_mutex_unlock(&ctx->mutex);
+  
+  return result;
+}
 
 extern int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 extern int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);

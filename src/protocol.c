@@ -85,6 +85,37 @@ static void process_read_cb(pty_process *process, pty_buf_t *buf, bool eof) {
     return;
   }
 
+  // Capture output for HTTP API if requested
+  if (ctx->pss->capturing_output && ctx->pss->cmd_ctx != NULL && buf != NULL) {
+    pthread_mutex_lock(&ctx->pss->cmd_ctx->mutex);
+    
+    // Append to output buffer
+    size_t new_len = ctx->pss->cmd_ctx->output_len + buf->len;
+    if (new_len > ctx->pss->cmd_ctx->output_capacity) {
+      size_t new_capacity = ctx->pss->cmd_ctx->output_capacity == 0 ? 1024 : ctx->pss->cmd_ctx->output_capacity * 2;
+      while (new_capacity < new_len) new_capacity *= 2;
+      
+      ctx->pss->cmd_ctx->output = xrealloc(ctx->pss->cmd_ctx->output, new_capacity);
+      ctx->pss->cmd_ctx->output_capacity = new_capacity;
+    }
+    
+    memcpy(ctx->pss->cmd_ctx->output + ctx->pss->cmd_ctx->output_len, buf->base, buf->len);
+    ctx->pss->cmd_ctx->output_len = new_len;
+    
+    // Check if command has completed (simple heuristic: look for shell prompt)
+    // This is a simplified approach - in a real implementation, you would need
+    // a more robust way to detect command completion
+    if (buf->len > 0 && (buf->base[buf->len - 1] == '$' || buf->base[buf->len - 1] == '#' || 
+                         buf->base[buf->len - 1] == '>' || buf->base[buf->len - 1] == '%')) {
+      ctx->pss->cmd_ctx->complete = true;
+      ctx->pss->cmd_ctx->exit_code = 0;  // Assume success
+      pthread_cond_signal(&ctx->pss->cmd_ctx->cond);
+      ctx->pss->capturing_output = false;
+    }
+    
+    pthread_mutex_unlock(&ctx->pss->cmd_ctx->mutex);
+  }
+
   if (eof && !process_running(process))
     ctx->pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
   else
@@ -159,6 +190,10 @@ static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows) 
   }
   lwsl_notice("started process, pid: %d\n", process->pid);
   pss->process = process;
+  
+  // Register the terminal session for HTTP API
+  register_tty_session(pss);
+  
   lws_callback_on_writable(pss->wsi);
 
   return true;
@@ -233,6 +268,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->authenticated = false;
       pss->wsi = wsi;
       pss->lws_close_status = LWS_CLOSE_STATUS_NOSTATUS;
+      pss->cmd_ctx = NULL;
+      pss->capturing_output = false;
 
       if (server->url_arg) {
         while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
@@ -366,6 +403,16 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       lwsl_notice("WS closed from %s, clients: %d\n", pss->address, server->client_count);
       if (pss->buffer != NULL) free(pss->buffer);
       if (pss->pty_buf != NULL) pty_buf_free(pss->pty_buf);
+      
+      // Free command context if exists
+      if (pss->cmd_ctx != NULL) {
+        cmd_context_free(pss->cmd_ctx);
+        pss->cmd_ctx = NULL;
+      }
+      
+      // Unregister the terminal session
+      unregister_tty_session(pss);
+      
       for (int i = 0; i < pss->argc; i++) {
         free(pss->args[i]);
       }
