@@ -1,0 +1,55 @@
+# Stage 1: Builder
+FROM debian:bullseye AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libjson-c-dev \
+    libwebsockets-dev \
+    libuv1-dev \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Configure and build
+# Run git config to avoid fatal error during cmake about detached head or unknown revision
+RUN git config --global --add safe.directory /app && \
+    mkdir -p build && cd build && \
+    cmake .. && \
+    make -j$(nproc)
+
+# Stage 2: Final image for running the built ttyd
+# Using debian:bullseye-slim instead of alpine to avoid glibc/musl issues
+FROM debian:bullseye-slim AS final
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini \
+    libjson-c5 \
+    libuv1 \
+    libwebsockets16 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app # Using /app as a common practice for application directory
+
+# Copy the compiled ttyd executable from the builder stage
+# Placing it in /usr/local/bin is standard for manually compiled binaries
+COPY --from=builder /app/build/ttyd /usr/local/bin/ttyd
+
+# Expose the default ttyd port
+EXPOSE 7681
+
+# Use tini as the entrypoint to properly handle signals and reap zombie processes
+ENTRYPOINT ["/usr/bin/tini", "--", "ttyd"]
+
+# Default command to run when the container starts
+# Users can override this to specify their own command to be served by ttyd
+# Example: CMD ["bash"] to run bash, or CMD ["-W", "bash"] for a writable bash
+# For the new API, ttyd just needs to run, e.g. with "login" or any other placeholder.
+CMD ["login"]
