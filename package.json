@@ -1,0 +1,24 @@
+{
+  "name": "ttyd-nodejs",
+  "version": "1.0.0",
+  "description": "Node.js shared PTY terminal with WebSocket and REST API (ttyd-like)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node main.js",
+    "dev": "nodemon main.js",
+    "test": "node --test test/api.test.js",
+    "e2e": "node --test test/e2e.test.js"
+  },
+  "dependencies": {
+    "express": "^4.0.0",
+    "http": "^0.0.1-security",
+    "node-pty": "^1.0.0",
+    "serve-static": "^1.0.0",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "author": "",
+  "license": "MIT"
+}

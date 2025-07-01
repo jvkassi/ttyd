@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ttyd-nodejs Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css">
+  <style>
+    html, body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      background: #222;
+      box-sizing: border-box;
+    }
+    body {
+      min-height: 100vh;
+      min-width: 100vw;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: stretch;
+      overflow: hidden;
+    }
+    #terminal {
+      flex: 1 1 auto;
+      width: 100vw;
+      height: 100vh;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    #status {
+      position: absolute;
+      top: 0;
+      right: 0;
+      color: #fff;
+      background: #333a;
+      padding: 4px 10px;
+      font-size: 12px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+  <div id="terminal"></div>
+  <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client/dist/socket.io.min.js"></script>
+  <script>
+    const term = new Terminal({
+      cursorBlink: true,
+      fontFamily: 'monospace',
+      theme: { background: '#222' }
+    });
+    const fitAddon = new window.FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('terminal'));
+    fitAddon.fit();
+    term.focus();
+
+    const status = document.getElementById('status');
+    function setStatus(msg) { status.textContent = msg; }
+
+    // Connect socket.io
+    const socket = io({ path: '/ws' });
+    socket.on('connect', () => setStatus('Connected'));
+    socket.on('disconnect', () => setStatus('Disconnected'));
+    socket.on('connect_error', () => setStatus('Error'));
+
+    socket.on('output', data => {
+      term.write(data);
+    });
+    socket.on('buffer', data => {
+      term.write(data);
+    });
+
+    // Send input to server
+    term.onData(data => {
+      socket.emit('input', data);
+    });
+
+    // Resize support
+    function sendResize() {
+      const cols = term.cols;
+      const rows = term.rows;
+      socket.emit('resize', { cols, rows });
+    }
+    term.onResize(sendResize);
+    window.addEventListener('resize', () => {
+      fitAddon.fit();
+      sendResize();
+    });
+
+    // Ctrl+C and signals
+    term.attachCustomKeyEventHandler(e => {
+      if (e.ctrlKey && e.key === 'c') {
+        socket.emit('signal', 'SIGINT');
+        return false;
+      }
+      return true;
+    });
+  </script>
+</body>
+</html>
