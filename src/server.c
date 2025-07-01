@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #include "utils.h"
+#include "http_api.h"
 
 #ifndef TTYD_VERSION
 #define TTYD_VERSION "unknown"
@@ -22,13 +23,21 @@ struct lws_context *context;
 struct server *server;
 struct endpoints endpoints = {"/ws", "/", "/token", ""};
 
+// Additional endpoints for HTTP API
+static const char *sse_endpoint = "/sse";
+static const char *api_endpoint = "/api";
+
 extern int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 extern int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 
 // websocket protocols
-static const struct lws_protocols protocols[] = {{"http-only", callback_http, sizeof(struct pss_http), 0},
-                                                 {"tty", callback_tty, sizeof(struct pss_tty), 0},
-                                                 {NULL, NULL, 0, 0}};
+static const struct lws_protocols protocols[] = {
+    {"http-only", callback_http, sizeof(struct pss_http), 0},
+    {"tty", callback_tty, sizeof(struct pss_tty), 0},
+    {"sse", callback_sse, sizeof(struct pss_sse), 0},
+    {"http-api", callback_http_api, 0, 0},
+    {NULL, NULL, 0, 0}
+};
 
 #ifndef LWS_WITHOUT_EXTENSIONS
 // websocket extensions
@@ -314,6 +323,9 @@ int main(int argc, char **argv) {
 
   int start = calc_command_start(argc, argv);
   server = server_new(argc, argv, start);
+  
+  // Initialize SSE clients
+  sse_clients_init();
 
   struct lws_context_creation_info info;
   memset(&info, 0, sizeof(info));
