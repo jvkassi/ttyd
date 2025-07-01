@@ -115,31 +115,20 @@ void capture_command_output(const char *data, size_t len) {
 // Function to execute a command in the ttyd terminal
 static char* execute_command(const char* command, int* exit_code) {
   // Find an active ttyd terminal session
-  struct pss_tty *active_session = NULL;
+  struct pss_tty *active_session = find_active_tty_session();
   
-  // Iterate through all active connections to find a terminal session
-  // This is a simplified approach - in a real implementation, you would need
-  // to properly iterate through all active connections
-  
-  // For now, we'll use a direct approach since we can't easily access the list of connections
-  // This is a limitation of the current implementation
-  
-  // Create a JSON response with an error message
+  // Create JSON response object
   json_object *json = json_object_new_object();
-  json_object_object_add(json, "stdout", json_object_new_string(""));
-  json_object_object_add(json, "stderr", json_object_new_string(
-    "This implementation currently executes commands directly on the server.\n"
-    "To execute commands in the ttyd terminal session, please use the WebSocket interface.\n"
-    "The HTTP API is provided for convenience but does not interact with the terminal session."
-  ));
-  json_object_object_add(json, "exit_code", json_object_new_int(1));
   
-  // Fall back to direct command execution
-  int stdout_pipe[2];
-  int stderr_pipe[2];
-  
-  if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
-    lwsl_err("pipe failed: %s\n", strerror(errno));
+  if (!active_session || !active_session->process || !process_running(active_session->process)) {
+    // No active terminal session found
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string(
+      "No active terminal session found.\n"
+      "Please open a terminal session in the browser first."
+    ));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
+    
     *exit_code = 1;
     const char* json_str = json_object_to_json_string(json);
     char* result = strdup(json_str);
@@ -147,13 +136,13 @@ static char* execute_command(const char* command, int* exit_code) {
     return result;
   }
   
-  pid_t pid = fork();
-  if (pid < 0) {
-    lwsl_err("fork failed: %s\n", strerror(errno));
-    close(stdout_pipe[0]);
-    close(stdout_pipe[1]);
-    close(stderr_pipe[0]);
-    close(stderr_pipe[1]);
+  // Create a command context to capture output
+  cmd_context_t *cmd_ctx = cmd_context_new();
+  if (!cmd_ctx) {
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string("Failed to create command context"));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
+    
     *exit_code = 1;
     const char* json_str = json_object_to_json_string(json);
     char* result = strdup(json_str);
@@ -161,125 +150,63 @@ static char* execute_command(const char* command, int* exit_code) {
     return result;
   }
   
-  if (pid == 0) {  // Child process
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
+  // Set the command context in the terminal session
+  active_session->cmd_ctx = cmd_ctx;
+  active_session->capturing_output = true;
+  
+  // Send the command to the terminal
+  if (!send_pty_command(active_session, command)) {
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string("Failed to send command to terminal"));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
     
-    // Redirect stdout and stderr to pipes
-    dup2(stdout_pipe[1], STDOUT_FILENO);
-    dup2(stderr_pipe[1], STDERR_FILENO);
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
     
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
+    active_session->cmd_ctx = NULL;
+    active_session->capturing_output = false;
+    cmd_context_free(cmd_ctx);
     
-    // Execute the command
-    execl("/bin/sh", "sh", "-c", command, NULL);
-    
-    // If execl returns, there was an error
-    exit(127);
+    return result;
   }
   
-  // Parent process
-  close(stdout_pipe[1]);
-  close(stderr_pipe[1]);
+  // Wait for command output (with timeout)
+  char *output = wait_for_command_output(cmd_ctx, 5000, exit_code);
   
-  // Read output from pipes
-  char buffer[4096];
-  ssize_t bytes_read;
-  char* stdout_output = NULL;
-  size_t stdout_size = 0;
-  char* stderr_output = NULL;
-  size_t stderr_size = 0;
+  // Clean up
+  active_session->cmd_ctx = NULL;
+  active_session->capturing_output = false;
+  cmd_context_free(cmd_ctx);
   
-  // Set pipes to non-blocking mode
-  fcntl(stdout_pipe[0], F_SETFL, O_NONBLOCK);
-  fcntl(stderr_pipe[0], F_SETFL, O_NONBLOCK);
-  
-  // Read from both pipes until process exits
-  int status;
-  while (waitpid(pid, &status, WNOHANG) == 0) {
-    // Read from stdout
-    bytes_read = read(stdout_pipe[0], buffer, sizeof(buffer) - 1);
-    if (bytes_read > 0) {
-      buffer[bytes_read] = '\0';
-      stdout_output = realloc(stdout_output, stdout_size + bytes_read + 1);
-      if (stdout_output) {
-        memcpy(stdout_output + stdout_size, buffer, bytes_read + 1);
-        stdout_size += bytes_read;
-      }
-    }
+  if (!output) {
+    json_object_object_add(json, "stdout", json_object_new_string(""));
+    json_object_object_add(json, "stderr", json_object_new_string("Command execution timed out"));
+    json_object_object_add(json, "exit_code", json_object_new_int(1));
     
-    // Read from stderr
-    bytes_read = read(stderr_pipe[0], buffer, sizeof(buffer) - 1);
-    if (bytes_read > 0) {
-      buffer[bytes_read] = '\0';
-      stderr_output = realloc(stderr_output, stderr_size + bytes_read + 1);
-      if (stderr_output) {
-        memcpy(stderr_output + stderr_size, buffer, bytes_read + 1);
-        stderr_size += bytes_read;
-      }
-    }
-    
-    usleep(10000);  // Sleep for 10ms to avoid busy waiting
-  }
-  
-  // Read any remaining output
-  while ((bytes_read = read(stdout_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
-    buffer[bytes_read] = '\0';
-    stdout_output = realloc(stdout_output, stdout_size + bytes_read + 1);
-    if (stdout_output) {
-      memcpy(stdout_output + stdout_size, buffer, bytes_read + 1);
-      stdout_size += bytes_read;
-    }
-  }
-  
-  while ((bytes_read = read(stderr_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
-    buffer[bytes_read] = '\0';
-    stderr_output = realloc(stderr_output, stderr_size + bytes_read + 1);
-    if (stderr_output) {
-      memcpy(stderr_output + stderr_size, buffer, bytes_read + 1);
-      stderr_size += bytes_read;
-    }
-  }
-  
-  close(stdout_pipe[0]);
-  close(stderr_pipe[0]);
-  
-  // Ensure null termination
-  if (stdout_output) {
-    stdout_output[stdout_size] = '\0';
-  } else {
-    stdout_output = strdup("");
-  }
-  
-  if (stderr_output) {
-    stderr_output[stderr_size] = '\0';
-  } else {
-    stderr_output = strdup("");
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    return result;
   }
   
   // Create JSON response
   json_object_put(json);
   json = json_object_new_object();
   
-  if (WIFEXITED(status)) {
-    *exit_code = WEXITSTATUS(status);
-  } else if (WIFSIGNALED(status)) {
-    *exit_code = 128 + WTERMSIG(status);
-  } else {
-    *exit_code = -1;
-  }
-  
-  json_object_object_add(json, "stdout", json_object_new_string(stdout_output));
-  json_object_object_add(json, "stderr", json_object_new_string(stderr_output));
+  // For simplicity, we put all output in stdout
+  // In a real implementation, you would need to separate stdout and stderr
+  json_object_object_add(json, "stdout", json_object_new_string(output));
+  json_object_object_add(json, "stderr", json_object_new_string(""));
   json_object_object_add(json, "exit_code", json_object_new_int(*exit_code));
   
   const char* json_str = json_object_to_json_string(json);
   char* result = strdup(json_str);
   
   json_object_put(json);
-  free(stdout_output);
-  free(stderr_output);
+  free(output);
   
   return result;
 }

@@ -30,12 +30,30 @@ extern struct lws_context *context;
 extern struct server *server;
 extern struct endpoints endpoints;
 
+// Global registry of active terminal sessions
+#define MAX_TTY_SESSIONS 16
+extern struct pss_tty *tty_sessions[MAX_TTY_SESSIONS];
+extern int tty_session_count;
+extern pthread_mutex_t tty_sessions_mutex;
+
 struct pss_http {
   char path[128];
   char *buffer;
   char *ptr;
   size_t len;
 };
+
+// Command execution context for HTTP API
+typedef struct {
+  char *output;
+  size_t output_len;
+  size_t output_capacity;
+  bool complete;
+  int exit_code;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  struct timespec start_time;
+} cmd_context_t;
 
 struct pss_tty {
   bool initialized;
@@ -55,12 +73,25 @@ struct pss_tty {
   pty_buf_t *pty_buf;
 
   int lws_close_status;
+  
+  // For HTTP API
+  cmd_context_t *cmd_ctx;
+  bool capturing_output;
 };
 
 typedef struct {
   struct pss_tty *pss;
   bool ws_closed;
 } pty_ctx_t;
+
+// HTTP API functions
+void register_tty_session(struct pss_tty *pss);
+void unregister_tty_session(struct pss_tty *pss);
+struct pss_tty *find_active_tty_session();
+cmd_context_t *cmd_context_new();
+void cmd_context_free(cmd_context_t *ctx);
+bool send_pty_command(struct pss_tty *pss, const char *command);
+char *wait_for_command_output(cmd_context_t *ctx, int timeout_ms, int *exit_code);
 
 struct server {
   int client_count;        // client count

@@ -4,9 +4,9 @@ This document describes the HTTP API added to ttyd for executing commands and re
 
 ## Overview
 
-The ttyd HTTP API allows you to execute shell commands on the server and receive the results in JSON format. This enables programmatic interaction with the server's shell without requiring a WebSocket connection.
+The ttyd HTTP API allows you to execute shell commands in the active ttyd terminal session and receive the results in JSON format. This enables programmatic interaction with the terminal session without requiring a WebSocket connection.
 
-> **Note:** The current implementation executes commands directly on the server, not through the ttyd terminal session. This means that commands executed via the HTTP API will not appear in the ttyd terminal window and won't have access to the terminal environment variables or state. For full terminal interaction, please use the WebSocket interface.
+> **Note:** Commands executed via the HTTP API will appear in the ttyd terminal window and have access to the terminal environment variables and state. The API requires an active terminal session to be open in a browser window.
 
 ## API Endpoint
 
