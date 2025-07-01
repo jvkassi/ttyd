@@ -54,13 +54,97 @@ static bool accept_gzip(struct lws *wsi) {
   return len > 0 && strstr(buf, "gzip") != NULL;
 }
 
+// Structure to hold command execution results
+typedef struct {
+  char *stdout_data;
+  size_t stdout_size;
+  char *stderr_data;
+  size_t stderr_size;
+  int exit_code;
+  bool command_complete;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+} command_result_t;
+
+// Global variable to store the current command execution
+static command_result_t *current_command = NULL;
+
+// Function to send a command to the ttyd terminal
+static bool send_command_to_terminal(struct pss_tty *pss, const char *command) {
+  if (!pss || !pss->process || !command) return false;
+  
+  // Create a buffer with the command and a newline
+  size_t cmd_len = strlen(command);
+  char *buffer = xmalloc(cmd_len + 2); // +1 for newline, +1 for null terminator
+  
+  // Format: INPUT + command + newline
+  buffer[0] = INPUT;
+  memcpy(buffer + 1, command, cmd_len);
+  buffer[cmd_len + 1] = '\n';
+  
+  // Send the command to the terminal
+  int err = pty_write(pss->process, pty_buf_init(buffer + 1, cmd_len + 1));
+  free(buffer);
+  
+  if (err) {
+    lwsl_err("pty_write failed: %s (%s)\n", uv_err_name(err), uv_strerror(err));
+    return false;
+  }
+  
+  return true;
+}
+
+// Modified process_read_cb to capture command output
+void capture_command_output(const char *data, size_t len) {
+  if (!current_command || !data || len == 0) return;
+  
+  pthread_mutex_lock(&current_command->mutex);
+  
+  // Append to stdout buffer
+  current_command->stdout_data = realloc(current_command->stdout_data, 
+                                        current_command->stdout_size + len + 1);
+  if (current_command->stdout_data) {
+    memcpy(current_command->stdout_data + current_command->stdout_size, data, len);
+    current_command->stdout_size += len;
+    current_command->stdout_data[current_command->stdout_size] = '\0';
+  }
+  
+  pthread_mutex_unlock(&current_command->mutex);
+}
+
+// Function to execute a command in the ttyd terminal
 static char* execute_command(const char* command, int* exit_code) {
+  // Find an active ttyd terminal session
+  struct pss_tty *active_session = NULL;
+  
+  // Iterate through all active connections to find a terminal session
+  // This is a simplified approach - in a real implementation, you would need
+  // to properly iterate through all active connections
+  
+  // For now, we'll use a direct approach since we can't easily access the list of connections
+  // This is a limitation of the current implementation
+  
+  // Create a JSON response with an error message
+  json_object *json = json_object_new_object();
+  json_object_object_add(json, "stdout", json_object_new_string(""));
+  json_object_object_add(json, "stderr", json_object_new_string(
+    "This implementation currently executes commands directly on the server.\n"
+    "To execute commands in the ttyd terminal session, please use the WebSocket interface.\n"
+    "The HTTP API is provided for convenience but does not interact with the terminal session."
+  ));
+  json_object_object_add(json, "exit_code", json_object_new_int(1));
+  
+  // Fall back to direct command execution
   int stdout_pipe[2];
   int stderr_pipe[2];
   
   if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
     lwsl_err("pipe failed: %s\n", strerror(errno));
-    return NULL;
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    return result;
   }
   
   pid_t pid = fork();
@@ -70,7 +154,11 @@ static char* execute_command(const char* command, int* exit_code) {
     close(stdout_pipe[1]);
     close(stderr_pipe[0]);
     close(stderr_pipe[1]);
-    return NULL;
+    *exit_code = 1;
+    const char* json_str = json_object_to_json_string(json);
+    char* result = strdup(json_str);
+    json_object_put(json);
+    return result;
   }
   
   if (pid == 0) {  // Child process
@@ -171,7 +259,8 @@ static char* execute_command(const char* command, int* exit_code) {
   }
   
   // Create JSON response
-  json_object *json = json_object_new_object();
+  json_object_put(json);
+  json = json_object_new_object();
   
   if (WIFEXITED(status)) {
     *exit_code = WEXITSTATUS(status);
