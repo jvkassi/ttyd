@@ -141,6 +141,103 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
         goto try_to_reuse;
       }
 
+      // Check if this is a request for the SSE client
+      if (strcmp(pss->path, "/sse-client") == 0) {
+        const char *sse_client_path = "sse-client.html";
+        int n = lws_serve_http_file(wsi, sse_client_path, "text/html", NULL, 0);
+        if (n < 0 || (n > 0 && lws_http_transaction_completed(wsi))) return 1;
+        break;
+      }
+      
+      // Check if this is an SSE endpoint request
+      if (strncmp(pss->path, "/sse/", 5) == 0) {
+        // Extract the terminal ID from the path
+        char terminal_id[64] = {0};
+        strncpy(terminal_id, pss->path + 5, sizeof(terminal_id) - 1);
+        
+        // Send SSE headers
+        unsigned char buffer[1024 + LWS_PRE], *p, *end;
+        p = buffer + LWS_PRE;
+        end = p + sizeof(buffer) - LWS_PRE;
+        
+        if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+            lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, 
+                                        (unsigned char *)"text/event-stream", 17, &p, end) ||
+            lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CACHE_CONTROL, 
+                                        (unsigned char *)"no-cache", 8, &p, end) ||
+            lws_finalize_http_header(wsi, &p, end) ||
+            lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+        
+        // Send initial event
+        char event[256];
+        sprintf(event, "id: 1\nevent: connected\ndata: {\"terminalId\": \"%s\"}\n\n", terminal_id);
+        if (lws_write_http(wsi, (unsigned char *)event, strlen(event)) < 0)
+            return 1;
+        
+        // Keep the connection open
+        lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE, 30);
+        
+        // Send some sample output
+        char output[256];
+        sprintf(output, "id: 2\nevent: output\ndata: V2VsY29tZSB0byB0aGUgU1NFIHRlcm1pbmFsIQ==\n\n");
+        if (lws_write_http(wsi, (unsigned char *)output, strlen(output)) < 0)
+            return 1;
+        
+        // Store the terminal ID in the user data for later reference
+        if (pss->buffer) free(pss->buffer);
+        pss->buffer = strdup(terminal_id);
+        
+        // Set up a timer to send keepalive events
+        lws_set_timer_usecs(wsi, 10 * LWS_USEC_PER_SEC); // 10 seconds
+        
+        // This will keep the connection open
+        return 0;
+      }
+      
+      // Check if this is an API endpoint request
+      if (strncmp(pss->path, "/api/", 5) == 0) {
+        // Extract the endpoint path
+        char *endpoint = pss->path + 5;
+        
+        // Check if this is a terminal input request
+        if (strncmp(endpoint, "terminal/", 9) == 0) {
+          char *terminal_id = endpoint + 9;
+          char *action = strchr(terminal_id, '/');
+          
+          if (action) {
+            *action = '\0'; // Null-terminate the terminal ID
+            action++; // Move to the action part
+            
+            if (strcmp(action, "input") == 0) {
+              // This is a POST request to send input to the terminal
+              // We'll handle it in the LWS_CALLBACK_HTTP_BODY callback
+              return 0;
+            }
+          }
+        }
+        
+        // Return a simple JSON response for any other API endpoint
+        unsigned char buffer[1024 + LWS_PRE], *p, *end;
+        p = buffer + LWS_PRE;
+        end = p + sizeof(buffer) - LWS_PRE;
+        
+        const char *response = "{\"status\":\"ok\",\"message\":\"API endpoint\"}";
+        
+        if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+            lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, 
+                                        (unsigned char *)"application/json", 16, &p, end) ||
+            lws_add_http_header_content_length(wsi, strlen(response), &p, end) ||
+            lws_finalize_http_header(wsi, &p, end) ||
+            lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+            return 1;
+        
+        if (lws_write_http(wsi, (unsigned char *)response, strlen(response)) < 0)
+            return 1;
+        
+        return lws_http_transaction_completed(wsi) ? 0 : 1;
+      }
+      
       if (strcmp(pss->path, endpoints.index) != 0) {
         lws_return_http_status(wsi, HTTP_STATUS_NOT_FOUND, NULL);
         goto try_to_reuse;
@@ -213,6 +310,110 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
       pss_buffer_free(pss);
       goto try_to_reuse;
 
+    case LWS_CALLBACK_HTTP_BODY:
+      // Handle POST data
+      if (strncmp(pss->path, "/api/terminal/", 14) == 0) {
+        char *terminal_id = pss->path + 14;
+        char *action = strchr(terminal_id, '/');
+        
+        if (action) {
+          *action = '\0'; // Null-terminate the terminal ID
+          action++; // Move to the action part
+          
+          if (strcmp(action, "input") == 0) {
+            // This is a POST request to send input to the terminal
+            // Create a temporary file to store the command output
+            char temp_file[128];
+            snprintf(temp_file, sizeof(temp_file), "/tmp/ttyd_cmd_%s.out", terminal_id);
+            
+            // Create a command that will execute the input and save output to the temp file
+            char cmd[1024];
+            char *input_data = strndup((char *)in, len);
+            
+            // Execute the command and capture output
+            snprintf(cmd, sizeof(cmd), "%s > %s 2>&1", input_data, temp_file);
+            system(cmd);
+            free(input_data);
+            
+            // Read the output file
+            FILE *fp = fopen(temp_file, "r");
+            char output[4096] = {0};
+            if (fp) {
+                size_t bytes_read = fread(output, 1, sizeof(output) - 1, fp);
+                output[bytes_read] = '\0';
+                fclose(fp);
+                unlink(temp_file); // Delete the temp file
+            }
+            
+            // Base64 encode the output
+            size_t encoded_len = ((strlen(output) + 2) / 3) * 4 + 1;
+            char *encoded = xmalloc(encoded_len);
+            if (encoded) {
+                lws_b64_encode_string(output, strlen(output), encoded, encoded_len);
+                
+                // Send an SSE event with the output
+                char sse_event[4096 + 256];
+                snprintf(sse_event, sizeof(sse_event), 
+                        "id: %d\nevent: output\ndata: %s\n\n", 
+                        rand() % 10000, encoded);
+                
+                // For simplicity, we'll just send the event to the current client
+                // In a real implementation, you would need to maintain a list of connected SSE clients
+                // and iterate through them to send events
+                
+                // Return the output in the response
+                unsigned char buffer[4096 + LWS_PRE], *p, *end;
+                p = buffer + LWS_PRE;
+                end = p + sizeof(buffer) - LWS_PRE;
+                
+                char response[4096 + 256];
+                snprintf(response, sizeof(response), 
+                        "{\"status\":\"ok\",\"message\":\"Command executed\",\"output\":\"%s\"}", 
+                        encoded);
+                
+                free(encoded);
+                
+                if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+                    lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, 
+                                                (unsigned char *)"application/json", 16, &p, end) ||
+                    lws_add_http_header_content_length(wsi, strlen(response), &p, end) ||
+                    lws_finalize_http_header(wsi, &p, end) ||
+                    lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+                    return 1;
+                
+                if (lws_write_http(wsi, (unsigned char *)response, strlen(response)) < 0)
+                    return 1;
+                
+                return lws_http_transaction_completed(wsi) ? 0 : 1;
+            }
+            
+            // If we couldn't allocate memory for the encoded output, return a simple response
+            unsigned char buffer[1024 + LWS_PRE], *p, *end;
+            p = buffer + LWS_PRE;
+            end = p + sizeof(buffer) - LWS_PRE;
+            
+            char response[256];
+            snprintf(response, sizeof(response), 
+                    "{\"status\":\"error\",\"message\":\"Failed to execute command for terminal %s\"}", 
+                    terminal_id);
+            
+            if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end) ||
+                lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE, 
+                                            (unsigned char *)"application/json", 16, &p, end) ||
+                lws_add_http_header_content_length(wsi, strlen(response), &p, end) ||
+                lws_finalize_http_header(wsi, &p, end) ||
+                lws_write(wsi, buffer + LWS_PRE, p - (buffer + LWS_PRE), LWS_WRITE_HTTP_HEADERS) < 0)
+                return 1;
+            
+            if (lws_write_http(wsi, (unsigned char *)response, strlen(response)) < 0)
+                return 1;
+            
+            return lws_http_transaction_completed(wsi) ? 0 : 1;
+          }
+        }
+      }
+      break;
+      
     case LWS_CALLBACK_HTTP_FILE_COMPLETION:
       goto try_to_reuse;
 #if (defined(LWS_OPENSSL_SUPPORT) || defined(LWS_WITH_TLS)) && !defined(LWS_WITH_MBEDTLS)
@@ -226,6 +427,19 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
       }
       break;
 #endif
+    case LWS_CALLBACK_TIMER:
+      // Send a keepalive event for SSE connections
+      if (pss->buffer && strncmp(pss->path, "/sse/", 5) == 0) {
+        char event[256];
+        sprintf(event, "id: %d\nevent: keepalive\ndata: {}\n\n", rand() % 10000);
+        if (lws_write_http(wsi, (unsigned char *)event, strlen(event)) < 0)
+            return 1;
+        
+        // Set up the next timer
+        lws_set_timer_usecs(wsi, 10 * LWS_USEC_PER_SEC); // 10 seconds
+      }
+      break;
+      
     default:
       break;
   }
